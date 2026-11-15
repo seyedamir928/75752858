@@ -116,7 +116,7 @@ export class GameEngine {
   private onHudUpdate: (snapshot: HudSnapshot) => void;
   private onCrosshairFrame: ((frame: CrosshairFrame) => void) | null = null;
 
-  private isSoftwareGl: boolean;
+  private isSoftwareGl = false;
   private renderer!: THREE.WebGLRenderer;
   private scene!: THREE.Scene;
   private camera!: THREE.PerspectiveCamera;
@@ -235,6 +235,7 @@ export class GameEngine {
   // Loop & lifecycle
   private frameId = 0;
   private disposed = false;
+  private contextLost = false;
   private lastTimeMs = 0;
   private hudSyncTimer = 0;
   private resizeObserver: ResizeObserver | null = null;
@@ -245,8 +246,6 @@ export class GameEngine {
     this.onHudUpdate = onHudUpdate;
     this.bestScore = this.loadBestScore();
     this.touchEnabled = typeof window !== 'undefined' && ('ontouchstart' in window || navigator.maxTouchPoints > 0);
-    this.isSoftwareGl = this.detectSoftwareGl();
-
     this.initRendererAndScene();
     this.buildLevel();
     this.buildPlayerRig();
@@ -264,18 +263,32 @@ export class GameEngine {
     this.scheduleNextFrame();
   }
 
-  private detectSoftwareGl(): boolean {
+  private createWebGLRenderer(): THREE.WebGLRenderer {
+    const attempts: THREE.WebGLRendererParameters[] = [
+      { antialias: true, powerPreference: 'high-performance' },
+      { antialias: false, powerPreference: 'default' },
+      { antialias: false, failIfMajorPerformanceCaveat: false },
+    ];
+
+    let lastError: unknown = null;
+    for (const opts of attempts) {
+      try {
+        return new THREE.WebGLRenderer(opts);
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('WebGL context could not be created.');
+  }
+
+  private detectSoftwareGlFromContext(gl: WebGLRenderingContext | WebGL2RenderingContext): boolean {
     try {
-      const probe = document.createElement('canvas');
-      const gl = probe.getContext('webgl2') || probe.getContext('webgl');
-      if (!gl) return true;
       const ext = gl.getExtension('WEBGL_debug_renderer_info');
       const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
       const gpu = String(gl.getParameter(param));
-      gl.getExtension('WEBGL_lose_context')?.loseContext();
       return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
     } catch {
-      return true;
+      return false;
     }
   }
 
@@ -300,10 +313,8 @@ export class GameEngine {
     const width = this.mountEl.clientWidth || window.innerWidth;
     const height = this.mountEl.clientHeight || window.innerHeight;
 
-    this.renderer = new THREE.WebGLRenderer({
-      antialias: !this.isSoftwareGl,
-      powerPreference: 'high-performance',
-    });
+    this.renderer = this.createWebGLRenderer();
+    this.isSoftwareGl = this.detectSoftwareGlFromContext(this.renderer.getContext());
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.15;
@@ -314,6 +325,8 @@ export class GameEngine {
     this.renderer.domElement.style.display = 'block';
     this.renderer.domElement.style.width = '100%';
     this.renderer.domElement.style.height = '100%';
+    this.renderer.domElement.addEventListener('webglcontextlost', this.handleContextLost, false);
+    this.renderer.domElement.addEventListener('webglcontextrestored', this.handleContextRestored, false);
     this.mountEl.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
@@ -763,6 +776,20 @@ export class GameEngine {
     this.pushHudSnapshot();
   };
 
+  private handleContextLost = (e: Event): void => {
+    e.preventDefault();
+    this.contextLost = true;
+    cancelAnimationFrame(this.frameId);
+    clearTimeout(this.frameId);
+  };
+
+  private handleContextRestored = (): void => {
+    if (this.disposed) return;
+    this.contextLost = false;
+    this.lastTimeMs = performance.now();
+    this.scheduleNextFrame();
+  };
+
   private handleMouseMove = (e: MouseEvent): void => {
     if (this.phase !== 'playing') return;
     if (!this.pointerLocked && !this.mouseDown) return;
@@ -1029,10 +1056,10 @@ export class GameEngine {
   // --- Main Loop & Pacing ---
 
   private scheduleNextFrame(): void {
-    if (this.disposed) return;
+    if (this.disposed || this.contextLost) return;
     if (this.isSoftwareGl) {
       this.afterDraw(() => {
-        if (!this.disposed) this.tick();
+        if (!this.disposed && !this.contextLost) this.tick();
       });
     } else {
       this.frameId = requestAnimationFrame(() => this.tick());
@@ -1045,7 +1072,7 @@ export class GameEngine {
       const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
       gl.flush();
       const poll = () => {
-        if (this.disposed) {
+        if (this.disposed || this.contextLost) {
           if (sync) gl.deleteSync(sync);
           return;
         }
@@ -1064,7 +1091,7 @@ export class GameEngine {
   }
 
   private tick(): void {
-    if (this.disposed) return;
+    if (this.disposed || this.contextLost) return;
 
     const nowMs = performance.now();
     const rawDt = (nowMs - this.lastTimeMs) / 1000;
@@ -1834,6 +1861,8 @@ export class GameEngine {
     this.textures.dispose();
     this.audio.dispose();
     this.composer?.dispose();
+    this.renderer.domElement.removeEventListener('webglcontextlost', this.handleContextLost, false);
+    this.renderer.domElement.removeEventListener('webglcontextrestored', this.handleContextRestored, false);
     this.renderer.dispose();
     if (this.renderer.domElement.parentNode === this.mountEl) {
       this.mountEl.removeChild(this.renderer.domElement);
