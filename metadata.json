@@ -1,0 +1,6 @@
+{
+  "name": "BODYCAM // ZERO-HOUR",
+  "description": "Hyper-realistic bodycam tactical FPS with raycasted acoustic occlusion, proximity comms, and cross-platform desktop & mobile controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
